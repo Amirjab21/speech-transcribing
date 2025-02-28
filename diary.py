@@ -121,7 +121,7 @@ def create_audio_patches(audio_array, sample_rate=16000, patch_duration=30):
 
 
 
-ID_TO_SPEAKER = {0: "spk00", 1: "spk01", 2: "spk02", 3: "spk03", 4: "spk04", 5: "spk05", 6: "spk06", 7: "spk07", 8: "spk08", 9: "spk09", 10: "spk10", 11: 'spk11', 12: 'spk12'}
+ID_TO_SPEAKER = {0: "spk00", 1: "spk01", 2: "spk02", 3: "spk03"}
 SPEAKER_TO_ID = {v: k for k, v in ID_TO_SPEAKER.items()}
 def get_training_examples(audio_example):
     target = get_speaker_intervals2(audio_example)
@@ -234,9 +234,9 @@ class AudioDiarizationModel(nn.Module):
         super(AudioDiarizationModel, self).__init__()
         
         self.encoder = encoder
-        self.fc = nn.Linear(transformer_d_model, max_speakers)  # 1024 is Whisper's hidden size
+        # self.fc = nn.Linear(transformer_d_model, max_speakers)  # 1024 is Whisper's hidden size
         
-        self.adaptive_pool = nn.AdaptiveAvgPool1d(num_elements)
+        # self.adaptive_pool = nn.AdaptiveAvgPool1d(num_elements)
         self.fc = nn.Linear(transformer_d_model, max_speakers)
         self.sigmoid = nn.Sigmoid()
 
@@ -246,15 +246,15 @@ class AudioDiarizationModel(nn.Module):
 
         x = self.encoder(x)  # Shape becomes (batch, sequence_length, hidden_size)
 
-        x = x.transpose(1, 2)  # Shape: (batch, hidden_size, sequence_length)
-        x = self.adaptive_pool(x)  # Shape: (batch, hidden_size, num_elements)
-        x = x.transpose(1, 2)  # Shape: (batch, num_elements, hidden_size)
+        batch_size = x.size(0)
+        x = x.reshape(batch_size, self.num_elements, -1, x.size(-1))  # Reshape to (batch, 10, seq_len/10, hidden_size)
+        x = x.mean(dim=2)  # Average over the extra sequence length dimension: (batch, 10, hidden_size)
+    
 
         x = self.fc(x)  # Shape becomes (batch, max_speakers)
-        
         x = self.sigmoid(x)
+        
         return x
-
 
 
     
@@ -264,54 +264,34 @@ def permutation_invariant_cross_entropy(preds, targets):
     Compute permutation-invariant cross-entropy loss with detailed debugging.
     """
     batch_size, num_elements, num_classes = preds.shape
-    # print(preds.shape, "shape")
-    # print("\n=== Debug Information ===")
-    # print(f"Predictions shape: {preds.shape}")
-    # print(f"Targets shape: {targets.shape}")
-    # print("\nPredictions (first batch):")
-    # print(preds[0])
-    # print("\nTargets (first batch):")
-    # print(targets[0])
 
     # Compute pairwise cross-entropy loss
     pairwise_loss = torch.zeros(batch_size, num_elements, num_elements, device=preds.device)
     for i in range(num_elements):
         for j in range(num_elements):
             pairwise_loss[:, i, j] = torch.nn.functional.cross_entropy(preds[:, i], targets[:, j], reduction='none')
-    
-    # print("\nPairwise Loss Matrix (first batch):")
-    print(pairwise_loss[0])
-
     # Find optimal assignment using the Hungarian algorithm
     total_loss = 0
     for b in range(batch_size):
         cost_matrix = pairwise_loss[b].detach().cpu().numpy()
         row_ind, col_ind = linear_sum_assignment(cost_matrix)
         
-        # print(f"\nBatch {b} Hungarian Algorithm Results:")
-        # print("Row indices:", row_ind)
-        # print("Column indices:", col_ind)
-        # print("Selected costs:", cost_matrix[row_ind, col_ind])
-        
         batch_loss = pairwise_loss[b, row_ind, col_ind].sum()
-        # print(f"Batch {b} loss: {batch_loss.item()}")
+
         total_loss += batch_loss
 
     avg_loss = total_loss / batch_size
-    # print(f"\nFinal average loss: {avg_loss.item()}")
-    # print("========================\n")
-
     return avg_loss
 
 
-batch_size = 8
+batch_size = 12
 num_elements = 10
-num_classes = 13
+num_classes = 4
 
 
 
 
-train_size = int(0.8 * len(example1))
+train_size = int(0.4 * len(example1))
 indices = torch.randperm(len(example1))
 train_indices = indices[:train_size]
 val_indices = indices[train_size:]
@@ -327,11 +307,11 @@ val_examples = [example1[i] for i in val_indices]
 encoder = DiarizationEncoder()
 
 model = AudioDiarizationModel(num_classes, encoder)
-optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
 model.to(DEVICE)
 model.train()
 
-number_epochs = 5
+number_epochs = 2
 
 
 class AudioDiarizationDataset(torch.utils.data.Dataset):
@@ -342,42 +322,39 @@ class AudioDiarizationDataset(torch.utils.data.Dataset):
         return len(self.dataset)
     
     def __getitem__(self, idx):
-        return get_training_examples(self.dataset[0]) #Looks like many are of length 410
+        return get_training_examples(self.dataset[idx]) #Looks like many are of length 410
     
 dataset = AudioDiarizationDataset(ds['test'])
+subset_dataset = torch.utils.data.Subset(dataset, train_indices)
 
 
 def collate_fn(batch):
-
     mels = []
     speaker_vectors = []
     
-    # Take the first example from each batch
+    # Take a random example from each batch
     for example_list in batch:
-        mels.append(example_list[0][0])  # First [0] gets first block, second [0] gets mel
-        speaker_vectors.append(example_list[0][1])  # First [0] gets first block, [1] gets speaker vector
+        random_idx = torch.randint(0, len(example_list), (1,)).item()  # Random index between 0 and len(example_list)-1
+        mels.append(example_list[random_idx][0])  # Get mel from random block change back to example_list[random_idx][0]
+        speaker_vectors.append(example_list[random_idx][1])  # Get speaker vector from random block change back to example_list[random_idx][1]
     
     # Stack them into tensors with batch dimension
-    mels = torch.stack(mels)  # Shape will be [batch_size, 1, 80, 3000]
+    mels = torch.stack(mels)
     speaker_vectors = torch.stack(speaker_vectors)
-    # print(len(batch), 'sil')
-    # print(len(batch[0])) # first batch
-    # print(len(batch[0][0])) # first 30s patch
-    # random_mel = batch[0][0][0]
-    # random_speaker = batch[0][0][1]
     
     return mels, speaker_vectors
 dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, num_workers=6 if torch.cuda.is_available() else 0, pin_memory=True)
 
 
 wandb.init(project="diarization")
-
+criterion = torch.nn.BCEWithLogitsLoss()
 for epoch in range(number_epochs):
     total_loss = 0
     progress_bar = tqdm(
             dataloader, desc=f"Epoch {epoch + 1}/{number_epochs}"
     )
     for batch_idx, example in enumerate(progress_bar):
+        batch_loss = 0
         tgt = example[1]
         mel = example[0]
         optimizer.zero_grad()
@@ -385,12 +362,61 @@ for epoch in range(number_epochs):
         # print(mel.shape, "mel shape")
         mel = mel.to(DEVICE)
         output = model(mel)
+        
         tgt = torch.tensor(tgt, device=DEVICE)
-        # print(output.shape, "output shape")
 
-        loss = permutation_invariant_cross_entropy(output, tgt)  # add batch dimension
+        active_predictions = output > 0.5
+        num_active_speakers = torch.sum(active_predictions, dim=2)  # Sum over speaker dimension
+        
+        # Calculate speaker penalties (vectorized)
+        speaker_penalties = torch.where(
+            num_active_speakers == 0,
+            torch.ones_like(num_active_speakers, dtype=torch.float),  # Penalty for no speakers
+            torch.maximum(num_active_speakers - 1, torch.zeros_like(num_active_speakers))  # Penalty for multiple speakers
+        )
+        
+        # Compute BCE loss (vectorized)
+        eps = 1e-7
+        output_clamped = torch.clamp(output, eps, 1 - eps)
+        bce_loss = -(tgt * torch.log(output_clamped) + (1 - tgt) * torch.log(1 - output_clamped))
+        
+        # Apply speaker penalties (broadcasting will handle the speaker dimension)
+        penalized_loss = bce_loss * (1 + 0.2 * speaker_penalties.unsqueeze(-1))
+        
+        # Average the loss
+        loss = torch.mean(penalized_loss)
+        # for i in range(output.shape[0]):  # Loop through batch
+        #     for j in range(output.shape[1]):  # Loop through time intervals
+        #         # Calculate number of active speakers in this interval
+        #         active_predictions = output[i, j] > 0.5
+        #         num_active_speakers = torch.sum(active_predictions)
+                
+        #         # Calculate penalties
+        #         if num_active_speakers == 0:
+        #             # Penalty for no speakers (same magnitude as having 2 speakers)
+        #             speaker_penalty = 1.0
+        #         else:
+        #             # Penalty increases with each additional speaker beyond 1
+        #             speaker_penalty = max(0, num_active_speakers - 1)
+                
+        #         # Calculate base BCE loss for each speaker
+        #         for k in range(output.shape[2]):  # Loop through speaker classes
+        #             pred = output[i, j, k]
+        #             target = tgt[i, j, k]
+        #             # Binary cross entropy: -[y * log(p) + (1-y) * log(1-p)]
+        #             eps = 1e-7  # Small epsilon to prevent log(0)
+        #             pred = torch.clamp(pred, eps, 1 - eps)  # Clamp values to prevent numerical instability
+        #             interval_loss = -(target * torch.log(pred) + (1 - target) * torch.log(1 - pred))
+                    
+        #             # Add speaker penalty to the loss
+        #             interval_loss = interval_loss * (1 + 0.2 * speaker_penalty)  # 20% increase per penalty unit
+        #             batch_loss += interval_loss
+        # loss = batch_loss / (output.shape[0] * output.shape[1] * output.shape[2])
+        # loss = permutation_invariant_cross_entropy(output, tgt)  # add batch dimension
+
+        # loss = criterion(output, tgt)
         # print(loss)
-        wandb.log({"batch loss": loss.item() / tgt.shape[0]})
+        wandb.log({"batch loss": loss.item() })
         progress_bar.set_postfix({"batch_loss": loss.item()})
         total_loss += loss.item()
         loss.backward()
@@ -398,11 +424,90 @@ for epoch in range(number_epochs):
     print(f"Epoch {epoch} loss: {total_loss / len(dataloader)}")
     print(output)
 
-checkpoint_path = 'best_model.pt'
-torch.save({ 'model_state_dict': model.state_dict()}, checkpoint_path)
-artifact = wandb.Artifact('model-weights', type='model')
-artifact.add_file(checkpoint_path)
-wandb.log_artifact(artifact)
+# checkpoint_path = 'best_model.pt'
+# torch.save({ 'model_state_dict': model.state_dict()}, checkpoint_path)
+# artifact = wandb.Artifact('model-weights', type='model')
+# artifact.add_file(checkpoint_path)
+# wandb.log_artifact(artifact)
     
-
-
+import soundfile as sf
+import matplotlib.pyplot as plt
+def run_single_inference(audio_array, model, sample_rate=16000, filename="test_audio.wav"):
+    """
+    Run diarization inference on first 30 seconds of an audio array.
+    
+    Args:
+        audio_array: Raw audio array from dataset
+        model: Trained AudioDiarizationModel
+        sample_rate: Target sample rate (default: 16000)
+    
+    Returns:
+        List of predicted speakers for each 3-second interval
+    """
+    # Take first 30 seconds (30 * sample_rate samples)
+    max_length = sample_rate * 30
+    if audio_array.shape[0] > max_length:
+        audio_array = audio_array[:max_length]
+    else:
+        # Pad with zeros if shorter than 30 seconds
+        padded_audio = numpy.zeros(max_length)
+        padded_audio[:audio_array.shape[0]] = audio_array
+        audio_array = padded_audio
+    sf.write(filename, audio_array, samplerate=16000)
+    # Convert to tensor and get mel spectrogram
+    audio_tensor = torch.tensor(audio_array).unsqueeze(0)
+    mel = processor.feature_extractor(audio_tensor.flatten(), sampling_rate=sample_rate)
+    mel = torch.tensor(mel.input_features)
+    mel = mel.unsqueeze(0)
+    # print(mel.shape, "mel shape")
+    
+    model.eval()
+    with torch.no_grad():
+        mel.to(DEVICE)
+        output = model(mel)
+        # Convert probabilities to binary predictions (threshold = 0.5)
+        print(output, "output shape")
+        predictions = (output > 0.55).int()
+    
+    plt.figure(figsize=(12, 6))
+    output_matrix = output.squeeze(0).detach().cpu().numpy()  # Shape: (10, 13)
+    
+    # Create x-axis values (0, 3, 6, ..., 27) for the 10 time intervals
+    time_steps = numpy.arange(output_matrix.shape[0]) * 3  # 10 steps of 3 seconds each
+    
+    # Plot each speaker's probabilities
+    for speaker_idx in range(output_matrix.shape[1]):  # Loop through 13 speakers
+        speaker_probs = output_matrix[:, speaker_idx]  # Get probabilities for current speaker
+        plt.plot(time_steps, speaker_probs,
+                label=ID_TO_SPEAKER[speaker_idx],
+                marker='o',
+                linewidth=2,
+                markersize=6)
+    
+    plt.xlabel('Time (seconds)')
+    plt.ylabel('Speaker Probability')
+    plt.title('Speaker Diarization Probabilities Over Time')
+    plt.grid(True, alpha=0.3)
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.tight_layout()
+    plt.show()
+        
+    # Convert speaker IDs to speaker names
+    speakers = []
+    for interval_pred in predictions[0]:  # Remove batch dimension
+        interval_speakers = [ID_TO_SPEAKER[i] for i, is_speaking in enumerate(interval_pred) if is_speaking]
+        speakers.append(interval_speakers)
+    
+    # Print predictions in a readable format
+    for interval_idx, interval_speakers in enumerate(speakers):
+        start_time = interval_idx * 3
+        end_time = start_time + 3
+        print(f"{start_time}s - {end_time}s: {', '.join(interval_speakers) if interval_speakers else 'No speaker'}")
+    
+    return speakers
+test_audio = ds['test'][0]['audio']['array']
+test_audio2 = ds['test'][3]['audio']['array']
+test_audio3 = ds['test'][2]['audio']['array']
+predictions = run_single_inference(test_audio, model, filename="test_audio.wav")
+predictions2 = run_single_inference(test_audio2, model, filename="test_audio2.wav")
+predictions3 = run_single_inference(test_audio3, model, filename="test_audio3.wav")
